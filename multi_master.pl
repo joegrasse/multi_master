@@ -17,16 +17,17 @@ use List::Util qw(max);
 use Getopt::Long;
 use File::Temp;
 use DBI;
+use File::Basename;
 
 my $script_path = $0;
 my $script;
-my $version = "1.1";
+my $version = "2.0";
 
 my $debug;
 my $quiet;
 my $force;
 my $close_connections;
-my $skip_lvs;
+my $connection_manager;
 my $ask_password;
 my $prompt_once;
 my $user;
@@ -36,8 +37,8 @@ my $port;
 my $socket;
 my $new_primary;
 my $mode;
-my $lvs_write_group;
-my $lvs_read_group;
+my $write_connections;
+my $read_connections;
 
 my $LOG_DEBUG = 1;
 my $LOG_INFO = 2;
@@ -51,6 +52,10 @@ my @cleanup;
 my @errors;
 my $in_cleanup = 0;
 my $ipvsadm = "/sbin/ipvsadm";
+my $ifconfig = "/sbin/ifconfig";
+my $ifup = "/sbin/ifup";
+my $ifdown = "/sbin/ifdown";
+my $arping = "/sbin/arping";
 
 sub _print_msg{
   my $log_level = pop;
@@ -97,33 +102,35 @@ sub script_name{
 }
 
 sub print_cleanup{
-  my $msg = "Did not run the following cleanup commands\n";
-
-  while(my $op = pop(@cleanup)){
-    if($op->{'type'} eq 'lvs'){
-      $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'} Group: $op->{'group'}\n";
-    }
-    elsif($op->{'type'} eq 'read_only'){
-      $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'}\n";
-    }
-    elsif($op->{'type'} eq 'unlock'){
-      $msg .= "Type: $op->{'type'} Host: $op->{'host'}\n";
-    }
-    elsif($op->{'type'} eq 'flush'){
-      $msg .= "Type: $op->{'type'} Host: $op->{'host'}\n";
-    }
-    elsif($op->{'type'} eq 'slave_wait'){
-      $msg .= "Type: $op->{'type'} Slave: $op->{'slave'} Host: $op->{'master'}\n";
-    }
-    elsif($op->{'type'} eq 'event'){
-      $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'}\n";
-    }
-    else{
-      $msg .= "Unknown cleanup type $op->{'type'}\n";
-    }
-  }
+  if(@cleanup > 0){  
+    my $msg = "Did not run the following cleanup commands\n";
   
-  log_msg($msg, $LOG_WARNING);
+    while(my $op = pop(@cleanup)){
+      if($op->{'type'} eq 'lvs'){
+        $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'} Group: $op->{'group'}\n";
+      }
+      elsif($op->{'type'} eq 'read_only'){
+        $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'}\n";
+      }
+      elsif($op->{'type'} eq 'unlock'){
+        $msg .= "Type: $op->{'type'} Host: $op->{'host'}\n";
+      }
+      elsif($op->{'type'} eq 'flush'){
+        $msg .= "Type: $op->{'type'} Host: $op->{'host'}\n";
+      }
+      elsif($op->{'type'} eq 'slave_wait'){
+        $msg .= "Type: $op->{'type'} Slave: $op->{'slave'} Host: $op->{'master'}\n";
+      }
+      elsif($op->{'type'} eq 'event'){
+        $msg .= "Type: $op->{'type'} Host: $op->{'host'} Action: $op->{'action'}\n";
+      }
+      else{
+        $msg .= "Unknown cleanup type $op->{'type'}\n";
+      }
+    }
+    
+    log_msg($msg, $LOG_WARNING);
+  }
 }
 
 sub log_msg{
@@ -171,6 +178,9 @@ sub cleanup{
       else{
         log_msg("Unknown lvs cleanup action ".$op->{'action'}, $LOG_ERR);
       }      
+    }
+    elsif($op->{'type'} eq 'vip'){
+      update_server_vip($op->{'host'}, $op->{'vip'}, $op->{'action'}, $LOG_ERR);
     }
     elsif($op->{'type'} eq 'read_only'){
       set_read_only($op->{'host'},$op->{'action'});
@@ -286,37 +296,36 @@ disables the events in the event scheduler by setting them to
 SLAVESIDE_DISABLED. On the new primary host, it sets the read_only variable to
 OFF and enables the events that were enable on the current primary host.
 
-Usage: $script --mode=[mode] --host=[host]
+Usage: $script --mode=[mode] --host=[host] --connection-manager=[connection-manager]
 
 Options:
-  --mode              Can be one of "status" or "set_primary". Mode of status 
-                      reports back host status, and set_primary sets a host to 
-                      be primary.
-  --host              The hosts to interact with. Can be pass multiple times for 
-                      more than one host, or can be a comma separated list of 
-                      hosts. Example: host or host:port
-  --primary           Sets the host that will become primary. Must be provided
-                      in host list.
-  --force             Used with mode "set_primary" if there is only one host 
-                      provided.
-  --close-connections Kills off any none system user connections (e.g. 
-                      replication, event scheduler users) on the current primary 
-                      server.
-  --user              MySQL username. (Current: $user)
-  --password          MySQL password
-  --port              MySQL port
-  --socket            MySQL socket
-  --lvs-write-group   LVS write group IP address and port. Required when not 
-                      skipping lvs. Example: host:port
-  --lvs-read-group    LVS read group IP address and port. Example: host:port
-  --skip-lvs          Disable LVS changes
-  --ask-password      Prompt for mysql password before connecting
-  --prompt-once       Only prompt for password once and use it for all connections
-  --debug             Turns on debugging output.
-  --quiet             Suppress diagnostic output, prints warnings and errors 
-                      only.
-  --version           Prints version information.
-  --help              Prints this help.
+  --mode               Can be one of "status" or "set_primary". Mode of status 
+                       reports back host status, and set_primary sets a host to 
+                       be primary.
+  --host               The hosts to interact with. Can be pass multiple times for 
+                       more than one host, or can be a comma separated list of 
+                       hosts. Example: host or host:port
+  --primary            Sets the host that will become primary. Must be provided
+                       in host list.
+  --force              Used with mode "set_primary" if there is only one host 
+                       provided.
+  --close-connections  Kills off any none system user connections (e.g. 
+                       replication, event scheduler users) on the current primary 
+                       server.
+  --user               MySQL username. (Current: $user)
+  --password           MySQL password
+  --port               MySQL port
+  --socket             MySQL socket
+  --connection-manager How connections are managed. Options none, vip, or lvs
+  --write-connections  Where write connections are directed. Example: host:port
+  --read-connections   Where read connections are directed. Example: host:port
+  --ask-password       Prompt for mysql password before connecting
+  --prompt-once        Only prompt for password once and use it for all connections
+  --debug              Turns on debugging output.
+  --quiet              Suppress diagnostic output, prints warnings and errors 
+                       only.
+  --version            Prints version information.
+  --help               Prints this help.
 
 EOF
  exit 1;
@@ -328,7 +337,6 @@ sub load_defaults{
   $quiet = 0;
   $force = 0;
   $close_connections = 0;
-  $skip_lvs = 0;
   $ask_password = 0;
   $prompt_once = 0;
 }
@@ -346,9 +354,9 @@ sub load_args{
     "force" => \$force,
     "mode=s" => \$mode,
     "close-connections" => \$close_connections,
-    "lvs-write-group=s" => \$lvs_write_group,
-    "lvs-read-group=s" => \$lvs_read_group,
-    "skip-lvs" => \$skip_lvs,
+    "write-connections=s" => \$write_connections,
+    "read-connections=s" => \$read_connections,
+    "connection-manager=s" => \$connection_manager,
     "ask-password" => \$ask_password,
     "prompt-once" => \$prompt_once,
     "debug" => \$debug,
@@ -369,14 +377,44 @@ sub validate_args{
     help();
   }
   
-  if($lvs_write_group && $lvs_write_group !~ /^[^:]+:.+$/){
-    print "Option lvs-write-group requires ip and port\n";
+  if(! defined $connection_manager){
+    print "Option connection-manager is required\n";
+    help();
+  }
+  elsif($connection_manager ne "none" && $connection_manager ne "lvs" && $connection_manager ne "vip"){
+    print "Invalid paramater for option connection-manager\n";
     help();
   }
   
-  if($lvs_read_group && $lvs_read_group !~ /^[^:]+:.+$/){
-    print "Option lvs-read-group requires ip and port\n";
+  if($connection_manager ne "none" && ! defined $write_connections){
+    print "Option write-connections is required. Use connection-manager=none otherwise.\n";
     help();
+  }
+  
+  if($connection_manager eq "lvs" && $write_connections && $write_connections !~ /^[^:]+:.+$/){
+    print "Option write-connections requires ip and port\n";
+    help();
+  }
+  
+  if($connection_manager eq "lvs" && $read_connections && $read_connections !~ /^[^:]+:.+$/){
+    print "Option read-connections requires ip and port\n";
+    help();
+  }
+  
+  if(($write_connections || $read_connections) && $connection_manager eq "none"){
+    print "Option write-connections or read-connections requires connection-manager lvs or vip\n";
+    help();
+  }
+  
+  # Strip port off of vips if any
+  if($connection_manager eq "vip"){
+    if($write_connections){
+      $write_connections =~ s/:.*$//;
+    }
+    
+    if($read_connections){
+      $read_connections =~ s/:.*$//;
+    }
   }
 
   if($mode eq "set_primary"){
@@ -392,11 +430,6 @@ sub validate_args{
     }
     elsif(@host != 2){
       print 'Invalid number of hosts for mode "set_primary"'."\n";
-      help();
-    }
-    
-    if(! $skip_lvs && ! defined $lvs_write_group){
-      print "Option lvs-write-group is required. Use skip-lvs to continue or specify the lvs write group\n";
       help();
     }
     
@@ -766,6 +799,48 @@ sub update_server_in_group{
   }
 }
 
+sub update_server_vip{
+  my $host_name = shift;
+  my $vip = shift;
+  my $action = shift;
+  my $error_level = shift;
+  
+  log_msg("Updating $host_name vip $vip to $action",$LOG_INFO);
+
+  my $interface = fileparse($dbh{$host_name}{'vip'}{$vip}{'ifcfg_file'});
+  $interface =~ s/^ifcfg-//;
+  
+  if($action eq 'up'){
+    my $interface_no_increment = $interface;
+    $interface_no_increment =~ s/:.*$//;
+    
+    my @program = (
+      'ssh',
+      $host_name,
+      "\"sudo $ifup $interface;sudo $arping -U -c 3 -I $interface_no_increment $vip\"" 
+    );
+    
+    my ($success, $stdout, $stderr) = run_command(@program);
+    
+    if(! $success){
+      log_msg("$stderr", $error_level);
+    }
+  }
+  else{    
+    my @program = (
+      'ssh',
+      $host_name,
+      "\"sudo $ifconfig $interface down\"" 
+    );
+    
+    my ($success, $stdout, $stderr) = run_command(@program);
+    
+    if(! $success){
+      log_msg("$stderr", $error_level);
+    }
+  }
+}
+
 sub get_status{
   log_msg("Getting hosts status", $LOG_DEBUG);
   foreach my $host_name (keys %dbh){    
@@ -774,7 +849,13 @@ sub get_status{
     get_slave_status($host_name);
   }
   
-  get_lvs_status();
+  if($connection_manager eq 'lvs'){
+    get_lvs_status();
+  }
+  elsif($connection_manager eq 'vip'){
+    get_vip_status();
+  }
+
   get_current_primary();
 }
 
@@ -831,47 +912,112 @@ sub get_slave_status{
 sub get_lvs_status{
   my @lvs_groups = ();
   
-  # Check that we are using an lvs
-  if($lvs_write_group){
-    push(@lvs_groups,$lvs_write_group);
-    push(@lvs_groups,$lvs_read_group) if $lvs_read_group;
+  push(@lvs_groups,$write_connections);
+  push(@lvs_groups,$read_connections) if $read_connections;
+
+  # Get the current lvs status
+  my %lvs_status = lvs_status();
   
-    # Get the current lvs status
-    my %lvs_status = lvs_status();
-    
-    # Look for each server in the current lvs status
-    foreach my $host_name (keys %dbh){
-      foreach my $lvs_group (@lvs_groups){
-        my $host = $dbh{$host_name}{'host'};
-        
-        if($lvs_status{$lvs_group}{'servers'}{$host}{'ip'}){
-          log_msg("Found server ".$lvs_status{$lvs_group}{'servers'}{$host}{'ip'}." in lvs group ".$lvs_group,$LOG_DEBUG);
-          $dbh{$host_name}{'lvs'}{$lvs_group} = $lvs_status{$lvs_group}{'servers'}{$host};
-        }
+  # Look for each server in the current lvs status
+  foreach my $host_name (keys %dbh){
+    foreach my $lvs_group (@lvs_groups){
+      my $host = $dbh{$host_name}{'host'};
+      
+      if($lvs_status{$lvs_group}{'servers'}{$host}{'ip'}){
+        log_msg("Found server ".$lvs_status{$lvs_group}{'servers'}{$host}{'ip'}." in lvs group ".$lvs_group,$LOG_DEBUG);
+        $dbh{$host_name}{'lvs'}{$lvs_group} = $lvs_status{$lvs_group}{'servers'}{$host};
       }
     }
   }
 }
 
+sub get_vip_status{
+  my @vips = ();
+  
+  push(@vips,$write_connections);
+  push(@vips,$read_connections) if $read_connections;
+
+  # Look at each server for each vip
+  foreach my $host_name (keys %dbh){
+    foreach my $vip (@vips){
+      my $host = $dbh{$host_name}{'host'};
+      
+      ($dbh{$host_name}{'vip'}{$vip}{'status'}, $dbh{$host_name}{'vip'}{$vip}{'ifcfg_file'})  = check_vip($host_name, $vip);
+    }
+  }
+}
+
+sub check_vip{
+  my $host = shift;
+  my $vip = shift;
+  
+  my $status;
+  my $ifcfg_file;
+  
+  log_msg("Checking status of VIP $vip on $host", $LOG_DEBUG);
+  
+  my @program = (
+    'ssh',
+    $host,
+    "\"$ifconfig | grep '$vip' | wc -l\"" 
+  );
+  
+  my ($success, $stdout, $stderr) = run_command(@program);
+  
+  if(! $success){
+    log_msg($stderr, $LOG_ERR);
+  }
+  elsif($success){
+    $status = $stdout;
+  }
+  
+  log_msg("Checking ifcfg file of VIP $vip on $host", $LOG_DEBUG);
+
+  @program = (
+    'ssh',
+    $host,
+    "\"find /etc/sysconfig/network-scripts/ -type f -name ifcfg-* -exec grep -l '$vip' {} \\;\"" 
+  );
+  
+  ($success, $stdout, $stderr) = run_command(@program);
+
+  if(! $success){
+    log_msg($stderr, $LOG_ERR);
+  }
+  elsif($success){
+    $ifcfg_file = $stdout;
+  }
+    
+  return ($status,$ifcfg_file);
+}
+
 sub get_current_primary{
   my $current_primary_candidate;
   my $error = 0;
+  my $connection_manager_test = 1;
   
   log_msg("Finding current primary server.", $LOG_DEBUG);
   
   # Loop through the db servers to locate the current primary
   foreach my $host_name (keys %dbh){
+    if($connection_manager eq 'lvs'){
+      $connection_manager_test = $dbh{$host_name}{'lvs'}{$write_connections}{'weight'};
+    }
+    elsif($connection_manager eq 'vip'){
+      $connection_manager_test = $dbh{$host_name}{'vip'}{$write_connections}{'status'};
+    }
+
     # Check that a primary isn't already found, that host is not set to read 
-    # only and that the lvs write group, and points to it if applicable
-    if(!$current_primary_candidate && $dbh{$host_name}{'read_only'} eq 'OFF' && (!$lvs_write_group || $dbh{$host_name}{'lvs'}{$lvs_write_group}{'weight'})){
+    # only and that the connection manager doesn't point to it if applicable
+    if(!$current_primary_candidate && $dbh{$host_name}{'read_only'} eq 'OFF' && $connection_manager_test){
       $current_primary_candidate = $host_name;
     }
-    # read only turned off but lvs write group doesn't point to it
+    # read only turned off but connection manager doesn't point to it
     elsif($dbh{$host_name}{'read_only'} eq 'OFF'){
       $error = 1;
     }
-    # read only on but lvs write group points to it
-    elsif($dbh{$host_name}{'read_only'} eq 'ON' && $lvs_write_group && $dbh{$host_name}{'lvs'}{$lvs_write_group}{'weight'}){
+    # read only on but connection manager points to it
+    elsif($dbh{$host_name}{'read_only'} eq 'ON' && $connection_manager_test && $connection_manager ne 'none'){
       $error = 1;
     }
   }
@@ -902,18 +1048,26 @@ sub print_status{
   my $fmt = "| %-${max_host}s | %-9s | %-15s | %-13s |";
   my $bar = "+-".("-" x $max_host)."-+-".("-" x 9)."-+-".("-" x 15)."-+-".("-" x 13)."-+";
   my @header = ("Host", "Read Only", "Event Scheduler", "Slave");
+  my $txt;
   
-  # Check if we need to add lvs status
-  if($lvs_write_group){
-    $fmt .= " %22s |";
-    $bar .= "-".("-" x 22)."-+";
-    push(@header, 'LVS Write Group Weight');
+  if($connection_manager eq 'LVS'){
+    $txt = 'Weight';
+  }
+  else{
+    $txt = 'Status';
   }
   
-  if($lvs_read_group){
+  # Check if we need to add connection manager status
+  if($connection_manager ne 'none' && $write_connections){
+    $fmt .= " %22s |";
+    $bar .= "-".("-" x 22)."-+";
+    push(@header, uc($connection_manager).' Write Group '.$txt);
+  }
+  
+  if($connection_manager ne 'none' && $read_connections){
     $fmt .= " %21s |";
     $bar .= "-".("-" x 21)."-+";
-    push(@header, 'LVS Read Group Weight');
+    push(@header, uc($connection_manager).' Read Group '.$txt);
   }
   
   $fmt .= "\n";
@@ -927,19 +1081,32 @@ sub print_status{
   foreach my $host_name (keys %dbh){
     my @options = (($dbh{$host_name}{'primary'} ? '*':'').$host_name, $dbh{$host_name}{'read_only'}, $dbh{$host_name}{'event_scheduler'}, $dbh{$host_name}{'slave_running'});
     
-    # Check if we need to add lvs status
-    if($lvs_write_group && $dbh{$host_name}{'lvs'}{$lvs_write_group}{'weight'}){
-      push(@options, $dbh{$host_name}{'lvs'}{$lvs_write_group}{'weight'});
-    }
-    elsif($lvs_write_group){
-      push(@options, 'NOT AVAILABLE');
-    }
-    
-    if($lvs_read_group && $dbh{$host_name}{'lvs'}{$lvs_read_group}{'weight'}){
-      push(@options, $dbh{$host_name}{'lvs'}{$lvs_read_group}{'weight'});
-    }
-    elsif($lvs_read_group){
-      push(@options, 'NOT AVAILABLE');
+    if($connection_manager ne 'none'){
+      if($write_connections){
+        # Check if we need to add lvs status
+        if($dbh{$host_name}{'lvs'}{$write_connections}{'weight'}){
+          push(@options, $dbh{$host_name}{'lvs'}{$write_connections}{'weight'});
+        }
+        # Check if we need to add vip status
+        elsif(defined $dbh{$host_name}{'vip'}{$write_connections}{'status'}){
+          push(@options, ($dbh{$host_name}{'vip'}{$write_connections}{'status'} ? 'UP' : 'DOWN'));
+        }
+        else{
+          push(@options, 'NOT AVAILABLE');
+        }
+      }
+      
+      if($read_connections){      
+        if($dbh{$host_name}{'lvs'}{$read_connections}{'weight'}){
+          push(@options, $dbh{$host_name}{'lvs'}{$read_connections}{'weight'});
+        }
+        elsif(defined $dbh{$host_name}{'vip'}{$read_connections}{'status'}){
+          push(@options, ($dbh{$host_name}{'vip'}{$read_connections}{'status'} ? 'UP' : 'DOWN'));
+        }
+        else{
+          push(@options, 'NOT AVAILABLE');
+        }
+      }
     }
     
     printf($fmt, @options);
@@ -1170,10 +1337,16 @@ sub set_primary{
       log_msg("Could not determine current primary server", $LOG_ERR);
     }
     
-    if(!$skip_lvs){
-      # Remove current primary from write group
-      remove_server_from_group($current_primary, $lvs_write_group, $LOG_ERR);
-      push(@cleanup, {'type' => 'lvs','host' => $current_primary,'action' => 'add','group' => $lvs_write_group});
+    if($connection_manager ne 'none'){
+      # Remove current primary from write connections
+      if($connection_manager eq 'lvs'){
+        remove_server_from_group($current_primary, $write_connections, $LOG_ERR);
+        push(@cleanup, {'type' => 'lvs','host' => $current_primary,'action' => 'add','group' => $write_connections});
+      }
+      else{
+        update_server_vip($current_primary, $write_connections, 'down', $LOG_ERR);
+        push(@cleanup, {'type' => 'vip','host' => $current_primary,'action' => 'up','vip' => $write_connections});
+      }
     }
 
     set_read_only($current_primary,'ON');
@@ -1199,10 +1372,16 @@ sub set_primary{
   ) unless $one_host;
   push(@cleanup,{'type' => 'read_only','host' => $new_primary,'action' => 'ON'});
 
-  if(!$skip_lvs){
-    # Enable new primary in write group
-    update_server_in_group($new_primary,$lvs_write_group,1000,$LOG_ERR);
-    push(@cleanup, {'type' => 'lvs','host' => $new_primary,'action' => 'remove','group' => $lvs_write_group});
+  if($connection_manager ne 'none'){
+    # Enable write connections to new primary
+    if($connection_manager eq 'lvs'){
+      update_server_in_group($new_primary,$write_connections,1000,$LOG_ERR);
+      push(@cleanup, {'type' => 'lvs','host' => $new_primary,'action' => 'remove','group' => $write_connections});
+    }
+    else{
+      update_server_vip($new_primary, $write_connections, 'up', $LOG_ERR);
+      push(@cleanup, {'type' => 'vip','host' => $new_primary,'action' => 'down','vip' => $write_connections});
+    }
   }
 
   if(! $one_host){
@@ -1217,12 +1396,22 @@ sub set_primary{
   # Clear cleanup tasks
   @cleanup = ();
   
-  if(!$skip_lvs && $lvs_read_group && ! $one_host){
-    # Enable current primary in read group
-    update_server_in_group($current_primary,$lvs_read_group,1000,$LOG_WARNING);
+  if($connection_manager ne 'none' && $read_connections && ! $one_host){
+    # Enable read connections to current primary
+    if($connection_manager eq 'lvs'){
+      update_server_in_group($current_primary,$read_connections,1000,$LOG_WARNING);
+    }
+    else{
+      update_server_vip($current_primary, $read_connections, 'up', $LOG_WARNING);
+    }
     
-    # Remove new primary from read group
-    remove_server_from_group($new_primary, $lvs_read_group,$LOG_WARNING);
+    # Remove new primary from read connections
+    if($connection_manager eq 'lvs'){
+      remove_server_from_group($new_primary, $read_connections,$LOG_WARNING);
+    }
+    else{
+      update_server_vip($new_primary, $read_connections, 'down', $LOG_WARNING);
+    }
   }
 
   # Check for event scheduler
