@@ -1,5 +1,11 @@
 ## ChangeLog for multi_master script
 
+## 2.0
+  * Added support for different connection managers
+  * Removed --lvs-write-group and --lvs-read-group options
+  * Added --write-connections and --read-connections options
+  * Added --connection-manager option
+
 ## 1.1
 
   * Don't kill off slave connections using GTIDs
